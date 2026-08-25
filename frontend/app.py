@@ -129,10 +129,7 @@ def _render_team_panel() -> None:
 
     for status in integration.get_features().values():
         tone = ui.status_tone(status.state)
-        label = {
-            "ready": "live", "fallback": "stub",
-            "missing": "pending", "error": "error",
-        }[status.state]
+        label = status.label
         st.sidebar.markdown(
             f'<div class="team-row"><span>{status.key}</span>'
             f"{ui.pill(label, tone)}</div>",

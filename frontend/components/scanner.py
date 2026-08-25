@@ -5,16 +5,18 @@ The Receipt Scanner tab.
 **Upload/preview/save flow owned by the Core Integrator;
 OCR and item splitting owned by the Vision & OCR Specialist.**
 
-The Integrator owns everything around their module: the uploader, the saved
-image file, the confirmation step, and the database write. The specialist owns
-exactly two functions:
+Contract note
+-------------
+This tab originally called ``extract_text()`` then ``split_receipt()``. The
+delivered module exposes ``process_receipt()``, which runs OCR, a deterministic
+regex parse and LLM structuring in one call -- and cross-checks the LLM's total
+against the regex total, rejecting the LLM result when they disagree. That is a
+better design than the two-step contract, so the contract was changed to match
+their module rather than the other way round.
 
-    extract_text(image_path: str) -> str
-    split_receipt(text: str) -> dict        # {"items": {name: price}, "total": float}
-
-Splitting it this way means they can build and test their pipeline on a folder
-of images with no Streamlit and no database involved -- which is the point of
-their role being described as isolated.
+Their module builds its own ``ollama.Client`` when no client is injected. The
+shell injects ``adapters.LLMEngineChatClient`` instead, so receipt parsing uses
+the shared connection and works against LM Studio too.
 """
 
 from __future__ import annotations
@@ -35,12 +37,7 @@ CATEGORY_NAMES = [name for name, _icon, _share in config.EXPENSE_CATEGORIES]
 
 
 def _save_upload(uploaded) -> Path:
-    """
-    Persist the upload so the OCR module receives a real file path.
-
-    A path rather than bytes keeps the specialist's function usable from a plain
-    script, which is how they will actually develop and debug it.
-    """
+    """Persist the upload so the OCR module receives a real file path."""
     config.RECEIPTS_DIR.mkdir(parents=True, exist_ok=True)
     suffix = Path(uploaded.name).suffix or ".png"
     target = config.RECEIPTS_DIR / f"receipt_{date.today():%Y%m%d}_{uploaded.name}"
@@ -49,22 +46,52 @@ def _save_upload(uploaded) -> Path:
     return target
 
 
+def _as_dict(result) -> dict:
+    """
+    Normalise the return value to a plain dict.
+
+    Their module returns a ``ReceiptResult`` dataclass with ``as_dict()``, but
+    accepting a bare dict too means a future rewrite on their side does not
+    break this tab.
+    """
+    if isinstance(result, dict):
+        return result
+    if hasattr(result, "as_dict"):
+        return result.as_dict()
+    return {}
+
+
 def _render_confirmation(student_id: int, parsed: dict, receipt_path: str) -> None:
     """Show extracted items and let the student save a single summary expense."""
-    items = parsed.get("items") or {}
+    items = parsed.get("items") or []
     total = parsed.get("total")
+    warnings = parsed.get("warnings") or []
+    confidence = parsed.get("confidence")
+
+    # Their module reports OCR confidence and self-diagnosed problems. Surfacing
+    # both is the whole point of a confirmation step -- a low-confidence scan is
+    # exactly when a student should check before saving.
+    if confidence is not None:
+        tone = "ok" if confidence >= 0.7 else "warn" if confidence >= 0.45 else "bad"
+        st.markdown(
+            f"OCR confidence: {ui.pill(f'{confidence:.0%}', tone)}",
+            unsafe_allow_html=True,
+        )
+    for warning in warnings:
+        st.warning(warning, icon=":material/warning:")
 
     if items:
         ui.section(f"{len(items)} items found")
         st.dataframe(
-            [{"Item": name, "Price": price} for name, price in items.items()],
+            [{"Item": item.get("name", ""), "Price": item.get("price", 0.0)}
+             for item in items],
             hide_index=True, width="stretch",
         )
 
     if total is None and items:
-        # Fall back to summing the items when the module could not read a total.
+        # Fall back to summing the items when no total could be read.
         try:
-            total = sum(float(value) for value in items.values())
+            total = sum(float(item.get("price", 0)) for item in items)
         except (TypeError, ValueError):
             total = 0.0
 
@@ -77,7 +104,7 @@ def _render_confirmation(student_id: int, parsed: dict, receipt_path: str) -> No
             category = st.selectbox("Category", CATEGORY_NAMES)
         with columns[2]:
             merchant = st.text_input("Merchant",
-                                     value=str(parsed.get("merchant", "")))
+                                     value=str(parsed.get("merchant") or ""))
         with columns[3]:
             txn_date = st.date_input("Date", value=date.today())
 
@@ -115,8 +142,6 @@ def render() -> None:
 
     ocr = integration.feature("ocr")
     if not ui.guard(ocr, "Receipt scanning"):
-        # Still show the uploader so the flow is demonstrable and the specialist
-        # has a live harness to test against the moment their module lands.
         st.file_uploader(
             "Receipt image", type=["png", "jpg", "jpeg"], disabled=True,
             help="Enabled once the OCR module is delivered.",
@@ -138,14 +163,45 @@ def render() -> None:
             ui.error_box(exc, "Could not save the uploaded image")
             return
 
+        # Route their LLM step through the shared engine; skip it entirely when
+        # no model is running so the deterministic regex parse still works.
+        from backend.adapters import LLMEngineChatClient
+
+        use_llm = llm_engine.is_available()
+        if not use_llm:
+            st.caption("No local LLM running - using deterministic parsing only.")
+
         with st.spinner("Reading receipt..."):
             try:
-                text = ocr.call("extract_text", str(receipt_path))
+                result = ocr.call(
+                    "process_receipt", str(receipt_path),
+                    use_llm=use_llm,
+                    llm_client=LLMEngineChatClient() if use_llm else None,
+                )
             except (integration.FeatureError, integration.FeatureUnavailable) as exc:
-                ui.error_box(exc, "Text extraction failed")
+                # Tesseract is a separate binary from the pytesseract package,
+                # and a missing PATH entry is by far the most common cause here.
+                if "tesseract" in str(exc).lower():
+                    st.error(
+                        "Tesseract is not installed or not on PATH. Install it from "
+                        "https://github.com/UB-Mannheim/tesseract/wiki, then restart "
+                        "the app.",
+                        icon=":material/error:",
+                    )
+                else:
+                    ui.error_box(exc, "Receipt processing failed")
                 return
 
-        if not text or not str(text).strip():
+        parsed = _as_dict(result)
+        if not parsed:
+            st.error(
+                f"The OCR module returned `{type(result).__name__}`; expected a "
+                "ReceiptResult or a dict."
+            )
+            return
+
+        raw_text = parsed.get("raw_text", "")
+        if not raw_text.strip():
             st.warning(
                 "No text could be read from that image. Try a sharper, "
                 "well-lit photo.",
@@ -154,24 +210,7 @@ def render() -> None:
             return
 
         with st.expander("Raw OCR text"):
-            st.code(text, language="text")
-
-        with st.spinner("Splitting items..."):
-            try:
-                parsed = ocr.call("split_receipt", text)
-            except (integration.FeatureError, integration.FeatureUnavailable) as exc:
-                ui.error_box(exc, "Receipt splitting failed")
-                return
-            except llm_engine.LLMUnavailableError as exc:
-                st.warning(str(exc), icon=":material/smart_toy:")
-                return
-
-        if not isinstance(parsed, dict):
-            st.error(
-                "The OCR module returned "
-                f"`{type(parsed).__name__}`; expected a dict with an `items` key."
-            )
-            return
+            st.code(raw_text, language="text")
 
         st.session_state["receipt_parsed"] = parsed
 

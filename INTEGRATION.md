@@ -16,6 +16,7 @@ moment you push a file matching the contract below, your feature lights up.
    | Badge | Meaning |
    |---|---|
    | `live` | Your module loaded, all required functions found |
+   | `adapted` | Your real code, reached through a bridge in `adapters.py` |
    | `stub` | Running on a reference implementation, not yours |
    | `pending` | Your module does not exist yet |
    | `error` | Your module exists but failed to import — expand **Integration detail** for the reason |
@@ -23,6 +24,74 @@ moment you push a file matching the contract below, your feature lights up.
 3. After pushing a file, hit **Reload team modules**. No restart needed.
 
 The **Integration detail** expander names the exact functions still missing.
+
+---
+
+## Merged so far
+
+| Branch | Role | Status |
+|---|---|---|
+| `feat/OCR-extraction` | 4 — Vision & OCR | merged, **live** |
+| `feature/analytics-forecasting` | 3 — Analytics | merged, **adapted** |
+
+Neither branch conflicted — both only added files. But neither matched the
+contract, so `backend/adapters.py` now bridges the differences. **Nobody's code
+was rewritten.** Read the notes for your role below.
+
+### What "adapted" means in the sidebar
+
+- **live** — your module bound directly to the contract
+- **adapted** — your real code, reached through a signature bridge in `adapters.py`
+- **stub** — a reference stand-in; your module has not arrived
+- **pending** — not written yet
+
+### Role 4 — what was reconciled
+
+Your `process_receipt()` is a better design than the contracted
+`extract_text()` + `split_receipt()` pair: one call, and it cross-checks the
+LLM's total against the deterministic regex total and rejects the LLM result
+when they disagree. **The contract was changed to match your module**, not the
+other way round. Nothing for you to change.
+
+Two notes:
+
+1. `_llm_structure()` builds its own `ollama.Client`. The shell now injects
+   `adapters.LLMEngineChatClient` instead, so receipt parsing uses the shared
+   connection and works against LM Studio too. Your fallback path still works
+   standalone — please keep the `llm_client` injection point.
+2. **The Tesseract binary is not installed on the integration machine.**
+   `pytesseract` imports fine and then fails at runtime with
+   `TesseractNotFoundError`. The scanner tab detects this and shows install
+   instructions rather than a traceback, but OCR cannot be demoed until someone
+   installs it.
+
+### Role 3 — what was reconciled
+
+Your module works and your own test script passes; your burn-rate figures agree
+exactly with the shell's independent calculation (₹484.26/day, ₹12.20 over).
+
+Three differences are bridged in `adapters.py` — fix them at your convenience
+and the adapter drops out automatically:
+
+1. **Name** — contract asks for `predict_broke_alert`, you shipped
+   `generate_broke_alert`.
+2. **Arguments** — you take `(student_id, conn)`; the contract passes
+   `(expenses: DataFrame, student: dict)`. The shell loads and caches the
+   DataFrame once per rerun, so your version re-queries SQLite on every chart.
+   Not wrong, just duplicated work.
+3. **Return shape** — you return `{burn_data, alert_text, source, prompt}`; the
+   UI renders `{message, severity}`. Note your `severity` lives *inside*
+   `burn_data`, and has four levels (`safe/warning/danger/critical`) mapped down
+   to the three the UI paints.
+
+Your charts live in `backend/analytics_engine.py` and return `go.Figure`.
+`frontend/components/charts.py` (written by the integrator) supplies the
+connection and calls `st.plotly_chart`. **Your charts are current-month scoped**
+— daily trend for this month, category split for this month — so the dashboard
+captions now say "this month" when yours are active. If you add an all-months
+trend, say so and the caption follows.
+
+`plotly` is now a hard requirement rather than commented out.
 
 ---
 
@@ -63,8 +132,8 @@ A reference detector runs until you ship: `analytics.detect_recurring()`
 
 ### Role 3 — Analytics & Forecasting Developer
 
-Two deliverables. The analytics module is already `live` with reference
-implementations you can extend or replace.
+**Merged and running** — see *What was reconciled* above. Your work is wired in
+through `adapters.py`. To drop the adapter, rename and reshape to:
 
 ```python
 # backend/forecasting.py
@@ -75,20 +144,10 @@ def predict_broke_alert(expenses: pd.DataFrame, student: dict) -> dict:
     """
 ```
 
-```python
-# frontend/components/charts.py
-def render_trend_chart(trend: pd.DataFrame) -> None:
-    """Columns: month (str 'YYYY-MM'), core, one_off, total. Call st.* directly."""
+Charts are rendered by `frontend/components/charts.py`, which the integrator
+wrote against your `analytics_engine` builders. You do not need to write it.
 
-def render_category_chart(categories: pd.DataFrame) -> None:
-    """Columns: category, amount, share_pct, transactions, avg_amount."""
-```
-
-Charts currently fall back to Streamlit's native charts. **If you use Plotly or
-Altair, add it to `requirements.txt`** — it is commented out there, because the
-shell must not hard-depend on a library you might not choose.
-
-> **Two traps already hit in the fallback charts, worth not repeating:**
+> **Traps already hit in the native fallback charts, worth not repeating:**
 > - Include the semester fees in the trend and the y-axis jumps to 80,000,
 >   flattening all ten normal months. Plot `core` by default.
 > - `st.bar_chart` sorts a category axis alphabetically, burying the largest
@@ -98,26 +157,23 @@ shell must not hard-depend on a library you might not choose.
 
 ### Role 4 — Vision & OCR Specialist
 
+**Merged and `live`.** The contract now matches what you built:
+
 ```python
 # backend/ocr_engine.py
-def extract_text(image_path: str) -> str:
-    """OpenCV preprocessing (greyscale, threshold, deskew) then OCR. Return raw text."""
+def extract_text(image_source) -> tuple[str, float]:
+    """OpenCV preprocessing then OCR. Returns (text, confidence)."""
 
-def split_receipt(text: str) -> dict:
-    """
-    Return: {"items": {name: price}, "total": float, "merchant": str}
-    'total' and 'merchant' are optional; the UI sums items when total is absent.
-    """
+def process_receipt(image_source, *, use_llm=True, llm_client=None) -> ReceiptResult:
+    """OCR + deterministic parse + LLM structuring, totals cross-validated."""
 ```
 
 You never touch the database or Streamlit. The shell saves the upload, hands you
-a path, shows your output for confirmation, and writes the row.
+a path, shows `raw_text`, `confidence`, `warnings` and `items` for confirmation,
+and writes the row.
 
-Use `llm_engine.chat_json()` for the LLM formatting step — it already handles
-markdown fences, chatty preambles, and one retry. Do not write your own parser.
-
-Requires `opencv-python-headless` and `pytesseract` (plus the Tesseract binary).
-`pytesseract` is installed; **OpenCV is not yet** — `pip install opencv-python-headless`.
+**The Tesseract binary still needs installing** before this can be demoed —
+`pytesseract` is only the Python binding.
 
 ### Role 5 — RAG & NLP Developer
 
@@ -224,7 +280,8 @@ stale figures for five minutes.
 | Database | `data/expenses.db`, 1,874 transactions, 3 personas |
 | Vector index | NumPy fallback (ChromaDB not installed) |
 | Embeddings | chat model (`nomic-embed-text` not pulled) |
-| Not installed | `opencv-python-headless`, `chromadb`, `plotly` |
+| Installed | `plotly`, `opencv-python`, `ollama`, `pytesseract`, `pillow` |
+| **Missing** | **Tesseract binary** (OCR fails at runtime), `chromadb` |
 
 ```bash
 python backend/scripts/generate_mock_data.py --force

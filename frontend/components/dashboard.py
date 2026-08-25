@@ -265,15 +265,28 @@ def render() -> None:
     _render_kpis(kpis, student)
     st.divider()
 
+    # The two chart sources cover different periods and scopes, so the captions
+    # have to follow whichever is actually rendering. The Analytics module plots
+    # the CURRENT MONTH day by day, across all categories; the native fallback
+    # plots EVERY MONTH with one-off fees separated out. Describing one while
+    # showing the other is how a demo loses its audience.
+    using_their_charts = _charts() is not None
+
     left, right = st.columns([3, 2])
     with left:
-        ui.section("Monthly spending", "Core spending separated from one-off fees.")
+        if using_their_charts:
+            ui.section("Daily spending", "Day by day through the current month.")
+        else:
+            ui.section("Monthly spending", "Core spending separated from one-off fees.")
         if trend.empty:
             ui.empty_state("Not enough history to plot a trend.")
         else:
             _chart_trend(trend)
     with right:
-        ui.section("Where it goes", "Share of core spending by category.")
+        if using_their_charts:
+            ui.section("Where it goes", "Share of this month's spending by category.")
+        else:
+            ui.section("Where it goes", "Share of core spending by category.")
         if categories.empty:
             ui.empty_state("No categorised spending yet.")
         else:

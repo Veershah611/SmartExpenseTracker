@@ -5,11 +5,9 @@
 
 # --- UI / Frontend ---------------------------------------------------------
 streamlit>=1.40.0            # Dashboard, tabs, chat UI, session state
-# Charts are owned by the Analytics role. The app shell uses Streamlit's native
-# charts so it never hard-depends on a library a teammate may not have chosen;
-# uncomment whichever they hand over.
-# plotly>=5.24.0
-# altair>=5.4.0
+# Required by backend/analytics_engine.py (Analytics role). The shell still
+# falls back to Streamlit's native charts if this is missing.
+plotly>=5.24.0
 
 # --- Data Processing -------------------------------------------------------
 pandas>=2.2.0                # All aggregation / group-by / rolling analytics
@@ -32,9 +30,12 @@ requests>=2.32.0             # Ollama + LM Studio HTTP clients, health checks
 # --- Vision / OCR (receipt scanning) ---------------------------------------
 opencv-python-headless>=4.10.0   # Pre-processing: greyscale, threshold, deskew
 pillow>=10.4.0                   # Image I/O bridge between Streamlit and cv2
-# OPTIONAL: real text extraction. Needs the Tesseract binary installed too.
-# Windows: https://github.com/UB-Mannheim/tesseract/wiki
-pytesseract>=0.3.13
+pytesseract>=0.3.13              # Tesseract bindings
+# NOTE: pytesseract is only the Python binding. The Tesseract BINARY is a
+# separate install and must be on PATH, or receipt scanning fails at runtime:
+#   Windows: https://github.com/UB-Mannheim/tesseract/wiki
+#   macOS:   brew install tesseract
+#   Linux:   apt install tesseract-ocr
 
 # --- Config / Utilities ----------------------------------------------------
 python-dotenv>=1.0.1         # Loads .env so no secrets/hosts are hard-coded

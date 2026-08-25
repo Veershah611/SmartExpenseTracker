@@ -71,8 +71,7 @@ FEATURE_CONTRACTS: tuple[FeatureContract, ...] = (
         module="backend.ghost_hunter",
         required=("find_recurring_charges",),
         headline="Subscription Ghost Hunter",
-        fallback="backend.analytics",      # detect_recurring() stands in
-        fallback_aliases={"find_recurring_charges": "detect_recurring"},
+        fallback="backend.adapters",       # wraps analytics.detect_recurring()
     ),
     FeatureContract(
         key="analytics",
@@ -88,7 +87,7 @@ FEATURE_CONTRACTS: tuple[FeatureContract, ...] = (
         module="backend.forecasting",
         required=("predict_broke_alert",),
         headline="Predictive Broke Alert",
-        fallback=None,
+        fallback="backend.adapters",
     ),
     FeatureContract(
         key="charts",
@@ -102,7 +101,7 @@ FEATURE_CONTRACTS: tuple[FeatureContract, ...] = (
         key="ocr",
         owner="Vision & OCR Specialist",
         module="backend.ocr_engine",
-        required=("extract_text", "split_receipt"),
+        required=("extract_text", "process_receipt"),
         headline="Smart Receipt Splitting",
         fallback=None,
     ),
@@ -154,6 +153,21 @@ class FeatureStatus:
     def icon(self) -> str:
         return {"ready": "OK", "fallback": "STUB",
                 "missing": "--", "error": "FAIL"}[self.state]
+
+    @property
+    def label(self) -> str:
+        """
+        Sidebar wording.
+
+        'adapted' and 'stub' are both the fallback state but mean very different
+        things: adapted is the teammate's real code reached through a signature
+        bridge, stub is a reference implementation standing in because their
+        module has not arrived. Showing both as "stub" would misreport delivered
+        work as missing.
+        """
+        if self.state == "fallback":
+            return "adapted" if self.module_name.endswith("adapters") else "stub"
+        return {"ready": "live", "missing": "pending", "error": "error"}[self.state]
 
     def call(self, name: str, *args: Any, **kwargs: Any) -> Any:
         """
