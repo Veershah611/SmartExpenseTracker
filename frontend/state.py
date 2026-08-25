@@ -169,3 +169,46 @@ def clear_chat() -> None:
             module.clear_chat_history(get_student_id())
         except Exception:  # noqa: BLE001 -- clearing history must never block the UI
             pass
+
+
+# --------------------------------------------------------------------------- #
+# Vector store bootstrap
+# --------------------------------------------------------------------------- #
+@st.cache_resource(show_spinner="Indexing your transactions for search...")
+def get_indexed_vector_store():
+    """
+    Build the vector store and index it once per session.
+
+    Without this the store is empty, retrieval returns nothing, and the
+    assistant answers from general knowledge instead of the student's data --
+    which is indistinguishable from the model making things up. Indexing has to
+    happen somewhere, and startup is the only place that guarantees it.
+
+    ``cache_resource`` (not ``cache_data``) because the store holds an open
+    ChromaDB handle and must be shared, not copied, across reruns.
+
+    Returns ``None`` if anything fails: semantic search is an enhancement, and
+    losing it must not take the chat tab down.
+    """
+    try:
+        from backend.vector_store import VectorStore
+
+        store = VectorStore()
+        if store.count(config.RAG_COLLECTION_KNOWLEDGE) == 0:
+            store.index_knowledge_base()
+        if store.count(config.RAG_COLLECTION_EXPENSES) == 0:
+            store.index_expenses()
+        return store
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def reindex_expenses() -> None:
+    """Re-index after a write so new transactions become searchable."""
+    store = get_indexed_vector_store()
+    if store is None:
+        return
+    try:
+        store.index_expenses()
+    except Exception:  # noqa: BLE001
+        pass
