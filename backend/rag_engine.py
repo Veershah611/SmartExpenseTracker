@@ -349,3 +349,48 @@ class RAGEngine:
         full_reply = "".join(full_reply_parts)
         if full_reply.strip():
             self._save_message(student_id, "assistant", full_reply)
+
+# ────────────────────────────────────────────────────────────────────
+# Integration Contract Exports
+# ────────────────────────────────────────────────────────────────────
+_RAG_ENGINE: RAGEngine | None = None
+
+def _get_rag_engine() -> RAGEngine:
+    global _RAG_ENGINE
+    if _RAG_ENGINE is None:
+        _RAG_ENGINE = RAGEngine(vector_store=VectorStore())
+    return _RAG_ENGINE
+
+def answer_question(question: str, student_id: int) -> str:
+    """Contract-shaped wrapper for the Chat Assistant tab."""
+    return _get_rag_engine().chat(question, student_id=student_id)
+
+def parse_quick_log(sentence: str) -> dict[str, Any]:
+    """
+    Contract-shaped wrapper over ``nlp_quick_log.parse_expense``.
+    """
+    from backend import nlp_quick_log
+    
+    parsed = nlp_quick_log.parse_expense(sentence)
+    
+    category_name = ""
+    category_id = parsed.get("category_id")
+    if category_id is not None:
+        conn = _get_conn(config.DB_PATH)
+        try:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                "SELECT name FROM categories WHERE id = ?", (category_id,)
+            ).fetchone()
+            if row:
+                category_name = row["name"]
+        finally:
+            conn.close()
+            
+    return {
+        "amount": parsed.get("amount", 0.0),
+        "category": category_name,
+        "merchant": parsed.get("merchant", ""),
+        "description": parsed.get("description", ""),
+        "txn_date": parsed.get("txn_date"),
+    }
