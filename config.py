@@ -51,16 +51,25 @@ for _directory in (DATA_DIR, RECEIPTS_DIR, VECTOR_STORE_PATH):
 # --------------------------------------------------------------------------- #
 # Ollama / LLM settings
 # --------------------------------------------------------------------------- #
-OLLAMA_HOST: str = os.getenv("OLLAMA_HOST", "http://localhost:11434")
+# The integrator owns this connection for the whole team, so both local
+# runtimes are supported. "auto" probes Ollama first, then LM Studio, so a
+# teammate running either one needs no config change.
+LLM_PROVIDER: str = os.getenv("LLM_PROVIDER", "auto")   # auto | ollama | lmstudio
 
-# llama3.2:3b is the sweet spot for a laptop demo: ~2 GB, fast first token.
-# Swap to "llama3.1:8b" or "mistral" on a stronger machine.
-OLLAMA_CHAT_MODEL: str = os.getenv("OLLAMA_CHAT_MODEL", "llama3.2:3b")
+OLLAMA_HOST: str = os.getenv("OLLAMA_HOST", "http://localhost:11434")
+LMSTUDIO_HOST: str = os.getenv("LMSTUDIO_HOST", "http://localhost:1234")
+
+# llama3.2 (3B) is the sweet spot for a laptop demo: ~2 GB, fast first token.
+# Swap to "llama3.1:8b", "gemma3:4b" or "mistral" on a stronger machine.
+OLLAMA_CHAT_MODEL: str = os.getenv("OLLAMA_CHAT_MODEL", "llama3.2:latest")
 
 # nomic-embed-text: 768-dim, ~270 MB, far lighter than pulling in PyTorch via
 # sentence-transformers just to embed a few hundred expense rows.
+#   ollama pull nomic-embed-text
+# If it is not installed, vector_store.py falls back to embedding with the chat
+# model (lower quality, no extra download), and then to a lexical index if
+# Ollama is unreachable entirely. The demo never hard-fails on a missing model.
 OLLAMA_EMBED_MODEL: str = os.getenv("OLLAMA_EMBED_MODEL", "nomic-embed-text")
-EMBEDDING_DIM: int = 768
 
 LLM_TEMPERATURE: float = float(os.getenv("LLM_TEMPERATURE", "0.3"))  # low = factual
 LLM_TIMEOUT_SECONDS: int = int(os.getenv("LLM_TIMEOUT_SECONDS", "120"))

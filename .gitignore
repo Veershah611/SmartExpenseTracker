@@ -23,3 +23,9 @@ data/receipts/*
 Thumbs.db
 .idea/
 .vscode/
+
+# Streamlit local run config (keep the shared config.toml, ignore secrets)
+.streamlit/secrets.toml
+
+# Editor/agent local settings
+.claude/

@@ -3,6 +3,9 @@
 AI-enabled expense tracker for university students.
 **Use Case 12 — TCS Technology Day, Nirma University.**
 
+> **Building a module for this project? Read [INTEGRATION.md](INTEGRATION.md) first.**
+> It defines the contract your file must match, and how to verify it is wired in.
+
 Runs fully offline: SQLite for transactions, a local vector store for semantic
 search, and Ollama for the conversational assistant. No API keys, no cloud calls.
 
@@ -18,12 +21,20 @@ python backend/scripts/generate_mock_data.py --force
 streamlit run frontend/app.py
 ```
 
-You also need [Ollama](https://ollama.com) running locally:
+You also need [Ollama](https://ollama.com) or LM Studio running locally:
 
 ```bash
-ollama pull llama3.2:3b
+ollama pull llama3.2
+```
+
+Optional, improves semantic search quality:
+
+```bash
 ollama pull nomic-embed-text
 ```
+
+The app runs without either — the dashboard, analytics and Ghost Hunter work
+with no LLM at all, and the vector store falls back to a lexical index.
 
 ---
 
@@ -40,15 +51,19 @@ SmartExpenseTracker/
 │   ├── database.py             # Connection handling + typed CRUD helpers
 │   ├── analytics.py            # Pandas aggregations powering every chart
 │   ├── vector_store.py         # Chroma wrapper + NumPy fallback index
-│   ├── llm_engine.py           # Ollama client, health checks, streaming
-│   ├── rag_engine.py           # Retrieval + prompt assembly for the chat tab
-│   ├── insights.py             # Rule-based signals + LLM-written recommendations
-│   ├── ocr_engine.py           # OpenCV receipt pre-processing and parsing
+│   ├── llm_engine.py           # Ollama / LM Studio client, streaming, JSON mode
+│   ├── integration.py          # Teammate-module contracts and safe loading
+│   ├── ghost_hunter.py         # (Role 2) Subscription Ghost Hunter
+│   ├── forecasting.py          # (Role 3) Predictive Broke Alert
+│   ├── ocr_engine.py           # (Role 4) OpenCV receipt pipeline
+│   ├── rag_engine.py           # (Role 5) Retrieval + Quick Log parsing
 │   └── scripts/
 │       └── generate_mock_data.py   # Builds and seeds data/expenses.db
 │
 ├── frontend/                   # Presentation only — the ONLY layer importing streamlit
-│   ├── app.py                  # Entry point: tabs and layout, no business logic
+│   ├── app.py                  # Entry point: tabs, sidebar, global state
+│   ├── state.py                # Session state + cached data access
+│   ├── ui.py                   # Stylesheet and shared components
 │   └── components/             # One module per tab
 │
 ├── data/                       # Runtime state, shared, git-ignored

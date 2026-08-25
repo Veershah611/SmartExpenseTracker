@@ -5,7 +5,11 @@
 
 # --- UI / Frontend ---------------------------------------------------------
 streamlit>=1.40.0            # Dashboard, tabs, chat UI, session state
-plotly>=5.24.0               # Interactive charts rendered inside Streamlit
+# Charts are owned by the Analytics role. The app shell uses Streamlit's native
+# charts so it never hard-depends on a library a teammate may not have chosen;
+# uncomment whichever they hand over.
+# plotly>=5.24.0
+# altair>=5.4.0
 
 # --- Data Processing -------------------------------------------------------
 pandas>=2.2.0                # All aggregation / group-by / rolling analytics
@@ -20,8 +24,10 @@ numpy>=1.26.0                # Vector math + fallback cosine-similarity search
 chromadb>=0.5.20
 
 # --- LLM Integration (local, offline-friendly) -----------------------------
-ollama>=0.4.4                # Official Python client for the Ollama daemon
-requests>=2.32.0             # Health-checks + raw HTTP fallback to Ollama
+# The Ollama/LM Studio connection is spoken over plain HTTP rather than the
+# `ollama` package: both runtimes are then supported by one code path, and it
+# is one less dependency to install on a demo machine.
+requests>=2.32.0             # Ollama + LM Studio HTTP clients, health checks
 
 # --- Vision / OCR (receipt scanning) ---------------------------------------
 opencv-python-headless>=4.10.0   # Pre-processing: greyscale, threshold, deskew
