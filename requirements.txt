@@ -1,0 +1,34 @@
+# ---------------------------------------------------------------------------
+# Smart Expense Tracker  |  TCS Technology Day @ Nirma University
+# Python 3.11 - 3.13 supported.  Install with:  pip install -r requirements.txt
+# ---------------------------------------------------------------------------
+
+# --- UI / Frontend ---------------------------------------------------------
+streamlit>=1.40.0            # Dashboard, tabs, chat UI, session state
+plotly>=5.24.0               # Interactive charts rendered inside Streamlit
+
+# --- Data Processing -------------------------------------------------------
+pandas>=2.2.0                # All aggregation / group-by / rolling analytics
+numpy>=1.26.0                # Vector math + fallback cosine-similarity search
+
+# --- Database --------------------------------------------------------------
+# sqlite3 ships with the Python standard library -> no dependency needed.
+
+# --- Vector Database (semantic search over expenses & advice) --------------
+# Chroma is the primary store. If it fails to build on Python 3.13, comment it
+# out: src/vector_store.py automatically falls back to a NumPy index.
+chromadb>=0.5.20
+
+# --- LLM Integration (local, offline-friendly) -----------------------------
+ollama>=0.4.4                # Official Python client for the Ollama daemon
+requests>=2.32.0             # Health-checks + raw HTTP fallback to Ollama
+
+# --- Vision / OCR (receipt scanning) ---------------------------------------
+opencv-python-headless>=4.10.0   # Pre-processing: greyscale, threshold, deskew
+pillow>=10.4.0                   # Image I/O bridge between Streamlit and cv2
+# OPTIONAL: real text extraction. Needs the Tesseract binary installed too.
+# Windows: https://github.com/UB-Mannheim/tesseract/wiki
+pytesseract>=0.3.13
+
+# --- Config / Utilities ----------------------------------------------------
+python-dotenv>=1.0.1         # Loads .env so no secrets/hosts are hard-coded

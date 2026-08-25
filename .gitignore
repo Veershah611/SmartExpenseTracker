@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# Environment
+.env
+
+# Generated data (regenerate with: python scripts/generate_mock_data.py)
+data/*.db
+data/*.db-journal
+data/vector_store/
+data/receipts/*
+!data/receipts/.gitkeep
+
+# Streamlit
+.streamlit/secrets.toml
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
