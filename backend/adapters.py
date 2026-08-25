@@ -137,3 +137,87 @@ class LLMEngineChatClient:
         )
         # ocr_engine reads response["message"]["content"].
         return {"message": {"content": content}}
+
+
+# --------------------------------------------------------------------------- #
+# Conversational assistant + Quick Log  (RAG & NLP Developer)
+# --------------------------------------------------------------------------- #
+# They shipped a stateful RAGEngine class and nlp_quick_log.parse_expense();
+# the contract asks for module-level answer_question() and parse_quick_log().
+
+_RAG_ENGINE: Any = None
+
+
+def _rag_engine() -> Any:
+    """Build the RAGEngine once and reuse it -- it holds the vector store open."""
+    global _RAG_ENGINE
+    if _RAG_ENGINE is None:
+        from backend.rag_engine import RAGEngine
+        from backend.vector_store import VectorStore
+
+        _RAG_ENGINE = RAGEngine(vector_store=VectorStore())
+    return _RAG_ENGINE
+
+
+def answer_question(question: str, student_id: int) -> str:
+    """Contract-shaped wrapper over ``RAGEngine.chat``."""
+    return _rag_engine().chat(question, student_id=student_id)
+
+
+def parse_quick_log(sentence: str) -> dict[str, Any]:
+    """
+    Contract-shaped wrapper over ``nlp_quick_log.parse_expense``.
+
+    Theirs returns an INSERT-ready row keyed by ``category_id``; the
+    confirmation form needs a category *name*, so the id is resolved back here.
+    """
+    from backend import nlp_quick_log
+
+    parsed = nlp_quick_log.parse_expense(sentence)
+
+    category_name = ""
+    category_id = parsed.get("category_id")
+    if category_id is not None:
+        with _connection() as conn:
+            row = conn.execute(
+                "SELECT name FROM categories WHERE id = ?", (category_id,)
+            ).fetchone()
+        if row:
+            category_name = row["name"]
+
+    return {
+        "amount": parsed.get("amount", 0.0),
+        "category": category_name,
+        "merchant": parsed.get("merchant", ""),
+        "description": parsed.get("description", ""),
+        "txn_date": parsed.get("txn_date"),
+    }
+
+
+def describe_backend() -> dict[str, str]:
+    """
+    Vector-store diagnostics for the sidebar.
+
+    Their VectorStore does not expose the reporting helper the shell's original
+    one did, so the state is inspected here rather than added to their file.
+    """
+    try:
+        import chromadb  # noqa: F401
+
+        index = "ChromaDB"
+    except Exception:  # noqa: BLE001
+        index = "NumPy (fallback)"
+
+    from backend import llm_engine
+
+    status = llm_engine.get_status()
+    if not status.available:
+        embeddings = "unavailable (no LLM running)"
+    else:
+        bare = {name.split(":")[0] for name in status.models}
+        if config.OLLAMA_EMBED_MODEL.split(":")[0] in bare:
+            embeddings = f"Ollama: {config.OLLAMA_EMBED_MODEL}"
+        else:
+            embeddings = "lexical hashing (no embed model pulled)"
+
+    return {"index": index, "embeddings": embeddings, "mode": "adapter"}

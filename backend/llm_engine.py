@@ -410,3 +410,183 @@ def ask(prompt: str, system: str | None = None, **kwargs: Any) -> str:
         messages.append({"role": "system", "content": system})
     messages.append({"role": "user", "content": prompt})
     return chat(messages, **kwargs)
+
+
+# --------------------------------------------------------------------------- #
+# Compatibility layer for the RAG & NLP modules
+# --------------------------------------------------------------------------- #
+# Role 5 delivered their own llm_engine.py with a different API. Two versions of
+# the shared connection cannot coexist, and theirs is Ollama-only -- merging it
+# would silently drop LM Studio support and break six call sites across the
+# shell, the OCR bridge and the Insights tab.
+#
+# Their module names are provided here instead, delegating to the same
+# connection. Their rag_engine and nlp_quick_log then run unmodified, and the
+# app keeps one LLM connection rather than two competing ones.
+
+LLMError = LLMUnavailableError          # their exception name
+
+
+def check_health() -> bool:
+    """
+    Their name for :func:`is_available`, but probing fresh.
+
+    ``is_available()`` reads a status cached for a few seconds, which is right
+    for a dashboard issuing a dozen widget calls per rerun and wrong for a
+    health check -- a caller asking "is it up?" wants the answer now.
+    """
+    return get_status(force_refresh=True).available
+
+
+def list_local_models() -> list[str]:
+    """Model names installed on the active runtime."""
+    return get_status().models
+
+
+def ensure_model(model: str | None = None) -> None:
+    """Raise if no runtime is reachable. Model choice is resolved by _pick_model."""
+    status = get_status(force_refresh=True)
+    if not status.available:
+        raise LLMUnavailableError(
+            "No local LLM is running. Start Ollama (`ollama serve`) or "
+            "LM Studio's local server."
+        )
+
+
+def generate(
+    prompt: str,
+    *,
+    system: str = "",
+    model: str | None = None,
+    temperature: float | None = None,
+    timeout: int | None = None,
+) -> str:
+    """Single-shot generation -- their signature, our connection."""
+    messages: list[dict[str, str]] = []
+    if system:
+        messages.append({"role": "system", "content": system})
+    messages.append({"role": "user", "content": prompt})
+    return chat(messages, model=model, temperature=temperature, timeout=timeout)
+
+
+def generate_stream(
+    prompt: str,
+    *,
+    system: str = "",
+    model: str | None = None,
+    temperature: float | None = None,
+    timeout: int | None = None,
+) -> Iterator[str]:
+    """Streaming generation -- their signature, our connection."""
+    messages: list[dict[str, str]] = []
+    if system:
+        messages.append({"role": "system", "content": system})
+    messages.append({"role": "user", "content": prompt})
+    yield from chat_stream(messages, model=model, temperature=temperature)
+
+
+def generate_with_messages(
+    messages: list[dict[str, str]],
+    *,
+    model: str | None = None,
+    temperature: float | None = None,
+    timeout: int | None = None,
+) -> str:
+    """Multi-turn generation, used by ``rag_engine.RAGEngine.chat``."""
+    return chat(messages, model=model, temperature=temperature, timeout=timeout)
+
+
+def generate_stream_with_messages(
+    messages: list[dict[str, str]],
+    *,
+    model: str | None = None,
+    temperature: float | None = None,
+    timeout: int | None = None,
+) -> Iterator[str]:
+    """Multi-turn streaming, used by ``rag_engine.RAGEngine.chat_stream``."""
+    yield from chat_stream(messages, model=model, temperature=temperature)
+
+
+def embed(text: str, *, model: str | None = None) -> list[float]:
+    """
+    Embed one string, used by their vector_store.
+
+    Falls back from the embedding model to the chat model automatically, so a
+    machine without ``nomic-embed-text`` still returns usable vectors instead
+    of raising.
+    """
+    if not text or not text.strip():
+        raise LLMUnavailableError(
+            "Cannot embed an empty string - a zero vector matches every "
+            "document equally and silently corrupts retrieval."
+        )
+    return embed_batch([text], model=model)[0]
+
+
+def embed_batch(texts: list[str], *, model: str | None = None) -> list[list[float]]:
+    """Embed several strings in one call."""
+    if not texts:
+        return []
+
+    # Implemented inline rather than delegating to vector_store: their
+    # vector_store imports this module, so reaching back into it would be a
+    # circular import.
+    status = get_status()
+    if not status.available:
+        raise LLMUnavailableError("No local LLM is running; cannot embed.")
+
+    # Prefer the dedicated embedding model, fall back to the chat model so a
+    # machine without `nomic-embed-text` still works.
+    bare = {name.split(":")[0] for name in status.models}
+    chosen = model or (
+        config.OLLAMA_EMBED_MODEL
+        if config.OLLAMA_EMBED_MODEL.split(":")[0] in bare
+        else status.model
+    )
+
+    try:
+        if status.provider == "ollama":
+            response = requests.post(
+                f"{status.host}/api/embed",
+                json={"model": chosen, "input": texts},
+                timeout=config.LLM_TIMEOUT_SECONDS,
+            )
+            response.raise_for_status()
+            return response.json()["embeddings"]
+
+        response = requests.post(
+            f"{status.host}/v1/embeddings",
+            json={"model": chosen, "input": texts},
+            timeout=config.LLM_TIMEOUT_SECONDS,
+        )
+        response.raise_for_status()
+        return [item["embedding"] for item in response.json()["data"]]
+    except (requests.RequestException, KeyError, ValueError):
+        # Chat-only models return 501 from /api/embed -- llama3.2 does. Rather
+        # than fail, fall back to deterministic lexical vectors so semantic
+        # search degrades to keyword matching instead of breaking. Pulling
+        # `nomic-embed-text` restores real embeddings.
+        return [_lexical_embedding(text) for text in texts]
+
+
+def _lexical_embedding(text: str, dim: int = 768) -> list[float]:
+    """
+    Deterministic bag-of-words hash vector, L2-normalised.
+
+    Not semantic -- "cheap" will not match "affordable" -- but it reliably
+    matches shared keywords, which is enough to retrieve the right advice
+    snippet for a query like "how do I save on food".
+    """
+    import hashlib
+    import math
+    import re
+
+    vector = [0.0] * dim
+    for token in re.findall(r"[a-z0-9]+", text.lower()):
+        if len(token) < 3:
+            continue
+        bucket = int.from_bytes(hashlib.md5(token.encode()).digest()[:4], "big") % dim
+        vector[bucket] += 1.0
+
+    norm = math.sqrt(sum(value * value for value in vector))
+    return [value / norm for value in vector] if norm else vector

@@ -111,7 +111,7 @@ FEATURE_CONTRACTS: tuple[FeatureContract, ...] = (
         module="backend.rag_engine",
         required=("answer_question",),
         headline="Conversational Assistant",
-        fallback=None,
+        fallback="backend.adapters",
     ),
     FeatureContract(
         key="quick_log",
@@ -119,7 +119,7 @@ FEATURE_CONTRACTS: tuple[FeatureContract, ...] = (
         module="backend.rag_engine",
         required=("parse_quick_log",),
         headline="Natural Language Quick Log",
-        fallback=None,
+        fallback="backend.adapters",
     ),
 )
 
@@ -349,8 +349,8 @@ def describe_environment() -> dict[str, Any]:
                             "detail": f"{type(exc).__name__}: {exc}"}
 
     try:
-        from backend import vector_store
-        info["vectors"] = vector_store.describe_backend()
+        from backend import adapters
+        info["vectors"] = adapters.describe_backend()
     except Exception as exc:  # noqa: BLE001
         info["vectors"] = {"index": "unavailable", "embeddings": "-",
                            "mode": f"{type(exc).__name__}"}
