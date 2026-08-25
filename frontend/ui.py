@@ -132,6 +132,21 @@ def money_compact(amount: float) -> str:
         return f"{config.CURRENCY_SYMBOL}0"
 
 
+def money_signed(amount: float) -> str:
+    """
+    Signed currency with the sign OUTSIDE the symbol.
+
+    Naive formatting produces "Rs -4,435", which reads as a strange amount
+    rather than a decrease. Finance conventions put the sign first.
+    """
+    try:
+        value = float(amount)
+    except (TypeError, ValueError):
+        return money_compact(0)
+    sign = "-" if value < 0 else "+"
+    return f"{sign}{money_compact(abs(value))}"
+
+
 def section(title: str, note: str = "") -> None:
     """A titled section header with an optional one-line explanation."""
     st.markdown(f'<div class="section-title">{title}</div>', unsafe_allow_html=True)

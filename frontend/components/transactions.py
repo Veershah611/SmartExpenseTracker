@@ -192,10 +192,17 @@ def _render_table(expenses: pd.DataFrame) -> None:
 
     display = filtered.head(limit).copy()
     display["txn_date"] = display["txn_date"].dt.strftime("%d %b %Y")
-    st.dataframe(
+
+    # Row selection drives deletion. The id column is carried through the frame
+    # but not displayed -- the selection returns positional indices, which are
+    # mapped back to real database ids below.
+    selection = st.dataframe(
         display[["txn_date", "merchant", "category", "amount",
                  "payment_mode", "source"]],
         hide_index=True, width="stretch", height=420,
+        on_select="rerun",
+        selection_mode="multi-row",
+        key="txn_table",
         column_config={
             "txn_date": st.column_config.TextColumn("Date", width="small"),
             "merchant": st.column_config.TextColumn("Merchant"),
@@ -205,6 +212,81 @@ def _render_table(expenses: pd.DataFrame) -> None:
             "source": st.column_config.TextColumn("Logged via", width="small"),
         },
     )
+
+    _render_delete(display, selection)
+
+
+def _render_delete(display: pd.DataFrame, selection) -> None:
+    """
+    Delete the rows selected in the table.
+
+    Deletion is irreversible and there is no undo, so it takes two clicks: the
+    first arms it and shows exactly what will go, the second commits. The
+    confirmation lists the rows rather than a count, because "delete 3
+    transactions" is not enough information to catch a mis-click.
+    """
+    rows = getattr(getattr(selection, "selection", None), "rows", None) or []
+    if not rows:
+        st.caption("Select rows in the table to delete them.")
+        return
+
+    chosen = display.iloc[rows]
+    total = float(chosen["amount"].sum())
+
+    st.warning(
+        f"**{len(chosen)} transaction(s) selected** - {ui.money(total)} total.",
+        icon=":material/delete:",
+    )
+    for row in chosen.itertuples():
+        st.caption(f"• {row.txn_date} — {row.merchant} — {ui.money(row.amount)}")
+
+    confirm_key = "confirm_delete_txns"
+    if not st.session_state.get(confirm_key):
+        if st.button("Delete selected", type="secondary"):
+            st.session_state[confirm_key] = True
+            st.rerun()
+        return
+
+    st.error("This cannot be undone.", icon=":material/warning:")
+    left, right = st.columns(2)
+    with left:
+        if st.button("Yes, delete permanently", type="primary", width="stretch"):
+            _delete_rows(chosen)
+            st.session_state[confirm_key] = False
+            st.rerun()
+    with right:
+        if st.button("Cancel", width="stretch"):
+            st.session_state[confirm_key] = False
+            st.rerun()
+
+
+def _delete_rows(chosen: pd.DataFrame) -> None:
+    """Delete each selected row through the data contract, then refresh caches."""
+    module = integration.feature("data").module
+    if module is None or not hasattr(module, "delete_expense"):
+        st.error("The data module does not support deletion.")
+        return
+
+    student_id = state.get_student_id()
+    deleted, failed = 0, 0
+    for expense_id in chosen["id"]:
+        try:
+            if module.delete_expense(int(expense_id), student_id):
+                deleted += 1
+            else:
+                failed += 1
+        except Exception:  # noqa: BLE001
+            failed += 1
+
+    # Both the cached reads and the semantic index now hold rows that no longer
+    # exist; leaving either stale would have the assistant quoting deleted spend.
+    state.clear_data_cache()
+    state.reindex_expenses()
+
+    if deleted:
+        st.success(f"Deleted {deleted} transaction(s).", icon=":material/check:")
+    if failed:
+        st.error(f"{failed} could not be deleted.")
 
 
 def render() -> None:

@@ -559,3 +559,153 @@ def build_full_report(student_id: int) -> dict:
         "payment_modes": payment_mode_split(expenses),
         "weekday": weekday_pattern(expenses),
     }
+
+
+# --------------------------------------------------------------------------- #
+# Month-over-month comparison
+# --------------------------------------------------------------------------- #
+def available_months(expenses: pd.DataFrame) -> list[str]:
+    """Every month present in the data, newest first, as 'YYYY-MM' strings."""
+    if expenses.empty:
+        return []
+    months = expenses["txn_date"].dt.to_period("M").unique()
+    return [str(month) for month in sorted(months, reverse=True)]
+
+
+def month_day_span(expenses: pd.DataFrame, month: str) -> tuple[int, int]:
+    """
+    Return ``(days_elapsed, days_in_month)`` for a month.
+
+    The current month is usually incomplete, and comparing 25 days against a
+    full 31 shows a ~20% "drop" that is purely an artefact of the calendar.
+    Callers use this to offer a like-for-like comparison instead.
+    """
+    period = pd.Period(month, freq="M")
+    days_in_month = period.days_in_month
+
+    in_month = expenses[expenses["txn_date"].dt.to_period("M") == period]
+    if in_month.empty:
+        return 0, days_in_month
+
+    today = pd.Timestamp.today().to_period("M")
+    if period == today:
+        # For the live month, elapsed days come from the calendar, not from the
+        # last transaction -- a quiet final week is data, not absence of data.
+        return min(pd.Timestamp.today().day, days_in_month), days_in_month
+    return days_in_month, days_in_month
+
+
+def compare_months(
+    expenses: pd.DataFrame,
+    month_a: str,
+    month_b: str,
+    same_period_only: bool = True,
+    exclude_one_off: bool = True,
+) -> dict:
+    """
+    Compare two months category by category.
+
+    ``month_a`` is the recent month, ``month_b`` the baseline it is measured
+    against. Positive ``change`` means more was spent in ``month_a``.
+
+    ``same_period_only`` truncates both months to the same number of days,
+    which is what makes a mid-month comparison honest. ``exclude_one_off``
+    drops semester fees, which otherwise swamp every other movement.
+
+    Returns a dict of headline totals plus a per-category DataFrame, so the UI
+    can render the summary and the table without recomputing anything.
+    """
+    columns = ["category", "amount_a", "amount_b", "change", "change_pct"]
+    empty = {
+        "month_a": month_a, "month_b": month_b,
+        "total_a": 0.0, "total_b": 0.0, "change": 0.0, "change_pct": 0.0,
+        "txns_a": 0, "txns_b": 0,
+        "daily_a": 0.0, "daily_b": 0.0,
+        "days_compared": 0, "truncated": False,
+        "categories": pd.DataFrame(columns=columns),
+        "biggest_increase": None, "biggest_decrease": None,
+        "one_off_a": 0.0, "one_off_b": 0.0,
+    }
+    if expenses.empty:
+        return empty
+
+    frame = expenses
+    one_off_a = one_off_b = 0.0
+    if exclude_one_off:
+        core, one_off = split_core_and_one_off(expenses)
+        frame = core
+        if not one_off.empty:
+            periods = one_off["txn_date"].dt.to_period("M").astype(str)
+            one_off_a = float(one_off.loc[periods == month_a, "amount"].sum())
+            one_off_b = float(one_off.loc[periods == month_b, "amount"].sum())
+
+    period_strings = frame["txn_date"].dt.to_period("M").astype(str)
+    slice_a = frame[period_strings == month_a].copy()
+    slice_b = frame[period_strings == month_b].copy()
+
+    # Like-for-like: cut both months to the shorter elapsed span.
+    days_a, _ = month_day_span(expenses, month_a)
+    days_b, _ = month_day_span(expenses, month_b)
+    days_compared = min(days_a, days_b) if (days_a and days_b) else max(days_a, days_b)
+    truncated = False
+    if same_period_only and days_compared:
+        if days_a != days_b:
+            truncated = True
+        slice_a = slice_a[slice_a["txn_date"].dt.day <= days_compared]
+        slice_b = slice_b[slice_b["txn_date"].dt.day <= days_compared]
+
+    total_a = float(slice_a["amount"].sum())
+    total_b = float(slice_b["amount"].sum())
+
+    grouped_a = slice_a.groupby("category")["amount"].sum()
+    grouped_b = slice_b.groupby("category")["amount"].sum()
+
+    categories = (
+        pd.DataFrame({"amount_a": grouped_a, "amount_b": grouped_b})
+        .fillna(0.0)
+        .reset_index()
+        .rename(columns={"index": "category"})
+    )
+    if categories.empty:
+        result = {**empty, "days_compared": days_compared, "truncated": truncated}
+        return result
+
+    categories["change"] = categories["amount_a"] - categories["amount_b"]
+    # A category with no spend last month is an infinite increase, not a
+    # percentage -- report it as NaN and let the UI render "new".
+    categories["change_pct"] = np.where(
+        categories["amount_b"] > 0,
+        categories["change"] / categories["amount_b"].replace(0, np.nan) * 100,
+        np.nan,
+    )
+    categories = categories.sort_values("change", ascending=False)[columns].round(2)
+
+    movers = categories[categories["change"] != 0]
+    biggest_increase = (
+        movers.iloc[0].to_dict()
+        if not movers.empty and movers.iloc[0]["change"] > 0 else None
+    )
+    biggest_decrease = (
+        movers.iloc[-1].to_dict()
+        if not movers.empty and movers.iloc[-1]["change"] < 0 else None
+    )
+
+    return {
+        "month_a": month_a,
+        "month_b": month_b,
+        "total_a": total_a,
+        "total_b": total_b,
+        "change": total_a - total_b,
+        "change_pct": ((total_a - total_b) / total_b * 100) if total_b else 0.0,
+        "txns_a": int(len(slice_a)),
+        "txns_b": int(len(slice_b)),
+        "daily_a": total_a / days_compared if days_compared else 0.0,
+        "daily_b": total_b / days_compared if days_compared else 0.0,
+        "days_compared": days_compared,
+        "truncated": truncated,
+        "categories": categories,
+        "biggest_increase": biggest_increase,
+        "biggest_decrease": biggest_decrease,
+        "one_off_a": one_off_a,
+        "one_off_b": one_off_b,
+    }

@@ -204,10 +204,20 @@ def get_indexed_vector_store():
 
 
 def reindex_expenses() -> None:
-    """Re-index after a write so new transactions become searchable."""
+    """
+    Rebuild the expense index after a write.
+
+    The collection is reset first: ``index_expenses`` upserts, so on its own it
+    would refresh surviving rows while leaving deleted ones behind as ghost
+    documents that semantic search could still surface.
+    """
     store = get_indexed_vector_store()
     if store is None:
         return
+    try:
+        store.reset(config.RAG_COLLECTION_EXPENSES)
+    except Exception:  # noqa: BLE001 -- reset is best-effort; reindex regardless
+        pass
     try:
         store.index_expenses()
     except Exception:  # noqa: BLE001

@@ -37,6 +37,7 @@ from backend import integration, llm_engine  # noqa: E402
 from frontend import state, ui  # noqa: E402
 from frontend.components import (  # noqa: E402
     assistant,
+    compare,
     dashboard,
     insights,
     scanner,
@@ -218,6 +219,7 @@ def main() -> None:
 
     tabs = st.tabs([
         "Overview",
+        "Compare",
         "Assistant",
         "Insights",
         "Transactions",
@@ -227,12 +229,14 @@ def main() -> None:
     with tabs[0]:
         _safe_render(dashboard.render, "Overview")
     with tabs[1]:
-        _safe_render(assistant.render, "Assistant")
+        _safe_render(compare.render, "Compare")
     with tabs[2]:
-        _safe_render(insights.render, "Insights")
+        _safe_render(assistant.render, "Assistant")
     with tabs[3]:
-        _safe_render(transactions.render, "Transactions")
+        _safe_render(insights.render, "Insights")
     with tabs[4]:
+        _safe_render(transactions.render, "Transactions")
+    with tabs[5]:
         _safe_render(scanner.render, "Receipt Scanner")
 
 
