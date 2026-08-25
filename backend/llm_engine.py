@@ -1,412 +1,399 @@
 """
 backend/llm_engine.py
 =====================
-The single LLM connection for the whole team.  **Owned by the Core Integrator.**
+Thin, project-wide wrapper around the **Ollama** daemon.
 
-Every teammate's feature needs the model -- the Broke Alert, the Receipt
-Splitter, the Quick Log parser, the chat assistant. If each of them opened their
-own connection we would get four different timeout policies, four different
-error messages, and four different ways to fail in front of a judge.
+Every module that needs LLM generation or embedding calls this file —
+never the ``ollama`` library directly. That keeps the coupling in one
+place: if the team later swaps Ollama for LM Studio or a cloud API,
+only this file changes.
 
-So they all call :func:`chat` or :func:`chat_json` and get:
-
-* one provider probe shared across the app (Ollama, then LM Studio)
-* one timeout and retry policy
-* structured errors instead of raw tracebacks
-* JSON-mode helpers, because three of the four creative features need the model
-  to return parseable JSON rather than prose
-
-Provider support
-----------------
-Ollama    -- native ``/api/chat``
-LM Studio -- OpenAI-compatible ``/v1/chat/completions``
-
-``LLM_PROVIDER=auto`` probes both, so a teammate running either one needs no
-config change.
+Public API
+----------
+- ``check_health()``       → ``bool``
+- ``ensure_model(model)``  → ``None`` (raises on failure)
+- ``generate(...)``        → ``str``
+- ``generate_stream(...)`` → ``Iterator[str]``
+- ``embed(text)``          → ``list[float]``
+- ``embed_batch(texts)``   → ``list[list[float]]``
 """
 
 from __future__ import annotations
 
 import json
-import re
-import sys
-import time
-from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Any, Iterator
+import logging
+from typing import Iterator
 
 import requests
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+try:
+    import ollama as _ollama_sdk
+except ImportError:  # pragma: no cover
+    _ollama_sdk = None  # type: ignore[assignment]
 
-import config  # noqa: E402
+import config
+
+logger = logging.getLogger(__name__)
+
+# ────────────────────────────────────────────────────────────────────
+# Custom exception
+# ────────────────────────────────────────────────────────────────────
+
+class LLMError(RuntimeError):
+    """Raised when the LLM backend is unreachable or returns an error."""
 
 
-class LLMUnavailableError(RuntimeError):
+# ────────────────────────────────────────────────────────────────────
+# Internal helpers
+# ────────────────────────────────────────────────────────────────────
+
+def _get_client() -> _ollama_sdk.Client:  # type: ignore[name-defined]
+    """Return an ``ollama.Client`` pointed at the configured host."""
+    if _ollama_sdk is None:
+        raise LLMError(
+            "The 'ollama' Python package is not installed. "
+            "Run:  pip install ollama>=0.4.4"
+        )
+    return _ollama_sdk.Client(host=config.OLLAMA_HOST)
+
+
+# ────────────────────────────────────────────────────────────────────
+# Health & model verification
+# ────────────────────────────────────────────────────────────────────
+
+def check_health() -> bool:
     """
-    Raised when no local LLM runtime can be reached.
+    Return ``True`` if the Ollama daemon is reachable, ``False`` otherwise.
 
-    Callers are expected to catch this and degrade -- show the rule-based
-    insight, skip the AI summary -- rather than let the tab crash. The whole
-    dashboard must stay usable with the model offline.
+    Uses a plain HTTP GET to ``/api/tags`` so it works even if the
+    ``ollama`` SDK is not installed.
     """
-
-
-# --------------------------------------------------------------------------- #
-# Provider status
-# --------------------------------------------------------------------------- #
-@dataclass
-class LLMStatus:
-    """Snapshot of the runtime, rendered in the sidebar's status panel."""
-
-    available: bool
-    provider: str = "none"          # 'ollama' | 'lmstudio' | 'none'
-    host: str = ""
-    model: str = ""
-    models: list[str] = field(default_factory=list)
-    detail: str = ""
-
-    @property
-    def badge(self) -> str:
-        """Short human label for the sidebar."""
-        if not self.available:
-            return "Offline"
-        return f"{self.provider.title()} - {self.model}"
-
-
-# Probing costs a network round trip and Streamlit reruns the script on every
-# widget interaction, so the result is cached for a few seconds.
-_STATUS_CACHE: dict[str, Any] = {"status": None, "checked_at": 0.0}
-_STATUS_TTL_SECONDS = 15.0
-
-
-def _probe_ollama(host: str, timeout: float = 3.0) -> list[str] | None:
-    """Return Ollama's installed models, or ``None`` if it is not running."""
     try:
-        response = requests.get(f"{host.rstrip('/')}/api/tags", timeout=timeout)
-        response.raise_for_status()
-        return [m["name"] for m in response.json().get("models", [])]
-    except (requests.RequestException, ValueError, KeyError):
-        return None
+        resp = requests.get(
+            f"{config.OLLAMA_HOST}/api/tags",
+            timeout=5,
+        )
+        return resp.status_code == 200
+    except (requests.ConnectionError, requests.Timeout):
+        return False
 
 
-def _probe_lmstudio(host: str, timeout: float = 3.0) -> list[str] | None:
-    """Return LM Studio's loaded models, or ``None`` if it is not running."""
+def list_local_models() -> list[str]:
+    """Return names of models already pulled on the Ollama host."""
     try:
-        response = requests.get(f"{host.rstrip('/')}/v1/models", timeout=timeout)
-        response.raise_for_status()
-        return [m["id"] for m in response.json().get("data", [])]
-    except (requests.RequestException, ValueError, KeyError):
-        return None
+        resp = requests.get(
+            f"{config.OLLAMA_HOST}/api/tags",
+            timeout=5,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        return [m["name"] for m in data.get("models", [])]
+    except Exception:
+        return []
 
 
-def get_status(force_refresh: bool = False) -> LLMStatus:
+def ensure_model(model: str | None = None) -> None:
     """
-    Detect the active runtime, honouring ``config.LLM_PROVIDER``.
-
-    Cached for a few seconds so a dashboard with a dozen widgets does not issue
-    a dozen probes per rerun.
+    Verify that *model* (default: the chat model from config) is available
+    on the Ollama host. Raises ``LLMError`` with a human-friendly message
+    if it is not.
     """
-    now = time.monotonic()
-    cached = _STATUS_CACHE["status"]
-    if (
-        not force_refresh
-        and cached is not None
-        and now - _STATUS_CACHE["checked_at"] < _STATUS_TTL_SECONDS
-    ):
-        return cached
-
-    preference = config.LLM_PROVIDER.lower()
-    status = LLMStatus(available=False, detail="No local LLM runtime detected.")
-
-    if preference in ("auto", "ollama"):
-        models = _probe_ollama(config.OLLAMA_HOST)
-        if models is not None:
-            status = LLMStatus(
-                available=True,
-                provider="ollama",
-                host=config.OLLAMA_HOST,
-                model=_pick_model(models, config.OLLAMA_CHAT_MODEL),
-                models=models,
-                detail=f"{len(models)} model(s) installed.",
-            )
-
-    if not status.available and preference in ("auto", "lmstudio"):
-        models = _probe_lmstudio(config.LMSTUDIO_HOST)
-        if models is not None:
-            status = LLMStatus(
-                available=True,
-                provider="lmstudio",
-                host=config.LMSTUDIO_HOST,
-                model=_pick_model(models, config.OLLAMA_CHAT_MODEL),
-                models=models,
-                detail=f"{len(models)} model(s) loaded.",
-            )
-
-    _STATUS_CACHE["status"] = status
-    _STATUS_CACHE["checked_at"] = now
-    return status
+    model = model or config.OLLAMA_CHAT_MODEL
+    if not check_health():
+        raise LLMError(
+            f"Ollama is not running at {config.OLLAMA_HOST}. "
+            "Start it with:  ollama serve"
+        )
+    local = list_local_models()
+    # Ollama may return fully-qualified names ("llama3.2:3b") or short
+    # names ("llama3.2").  Accept a match on either prefix or full name.
+    if not any(model == m or model == m.split(":")[0] for m in local):
+        raise LLMError(
+            f"Model '{model}' is not pulled. Run:  ollama pull {model}"
+        )
 
 
-def _pick_model(available: list[str], preferred: str) -> str:
-    """
-    Choose a model, tolerating tag differences.
+# ────────────────────────────────────────────────────────────────────
+# Text generation
+# ────────────────────────────────────────────────────────────────────
 
-    A ``llama3.2`` pull is listed as ``llama3.2:latest``, so an exact-match-only
-    check would fail on a machine that actually has the right model. Falls back
-    to whatever is installed rather than erroring -- a demo with the wrong model
-    beats a demo with no model.
-    """
-    if not available:
-        return preferred
-    if preferred in available:
-        return preferred
-
-    bare = preferred.split(":")[0]
-    for name in available:
-        if name.split(":")[0] == bare:
-            return name
-
-    # Prefer a general chat model over an embedding-only one.
-    for name in available:
-        if "embed" not in name.lower():
-            return name
-    return available[0]
-
-
-def is_available() -> bool:
-    """Cheap boolean for UI guards."""
-    return get_status().available
-
-
-# --------------------------------------------------------------------------- #
-# Chat
-# --------------------------------------------------------------------------- #
-def chat(
-    messages: list[dict[str, str]],
+def generate(
+    prompt: str,
+    *,
+    system: str = "",
     model: str | None = None,
     temperature: float | None = None,
-    json_mode: bool = False,
     timeout: int | None = None,
 ) -> str:
     """
-    Send a conversation and return the reply text.
+    Single-shot (non-streaming) text generation.
 
-    ``messages`` uses the standard ``[{"role": ..., "content": ...}]`` shape,
-    which both providers accept.
+    Parameters
+    ----------
+    prompt : str
+        The user / instruction text.
+    system : str
+        Optional system prompt prepended to the conversation.
+    model : str | None
+        Ollama model name. Falls back to ``config.OLLAMA_CHAT_MODEL``.
+    temperature : float | None
+        Sampling temperature. Falls back to ``config.LLM_TEMPERATURE``.
+    timeout : int | None
+        Request timeout in seconds. Falls back to ``config.LLM_TIMEOUT_SECONDS``.
 
-    Raises :class:`LLMUnavailableError` on any failure -- callers degrade.
+    Returns
+    -------
+    str
+        The complete generated text.
+
+    Raises
+    ------
+    LLMError
+        On any connectivity or generation failure.
     """
-    status = get_status()
-    if not status.available:
-        raise LLMUnavailableError(
-            "No local LLM is running.\n"
-            "Start Ollama (`ollama serve`) or LM Studio's local server, then retry."
-        )
+    model = model or config.OLLAMA_CHAT_MODEL
+    temperature = temperature if temperature is not None else config.LLM_TEMPERATURE
+    timeout = timeout if timeout is not None else config.LLM_TIMEOUT_SECONDS
 
-    model = model or status.model
-    temperature = config.LLM_TEMPERATURE if temperature is None else temperature
-    timeout = timeout or config.LLM_TIMEOUT_SECONDS
-
-    try:
-        if status.provider == "ollama":
-            payload: dict[str, Any] = {
-                "model": model,
-                "messages": messages,
-                "stream": False,
-                "options": {"temperature": temperature},
-            }
-            if json_mode:
-                payload["format"] = "json"
-            response = requests.post(
-                f"{status.host}/api/chat", json=payload, timeout=timeout
-            )
-            response.raise_for_status()
-            return response.json()["message"]["content"].strip()
-
-        payload = {
-            "model": model,
-            "messages": messages,
-            "temperature": temperature,
-            "stream": False,
-        }
-        if json_mode:
-            payload["response_format"] = {"type": "json_object"}
-        response = requests.post(
-            f"{status.host}/v1/chat/completions", json=payload, timeout=timeout
-        )
-        response.raise_for_status()
-        return response.json()["choices"][0]["message"]["content"].strip()
-
-    except requests.Timeout as exc:
-        raise LLMUnavailableError(
-            f"The model took longer than {timeout}s to respond. "
-            "A smaller model (llama3.2:3b) will be faster on a laptop."
-        ) from exc
-    except (requests.RequestException, KeyError, ValueError) as exc:
-        raise LLMUnavailableError(f"LLM request failed: {exc}") from exc
-
-
-def chat_stream(
-    messages: list[dict[str, str]],
-    model: str | None = None,
-    temperature: float | None = None,
-) -> Iterator[str]:
-    """
-    Yield reply tokens as they arrive, for ``st.write_stream``.
-
-    Streaming matters for the demo: a 3B model takes several seconds to finish,
-    and watching tokens appear reads as "working" where a frozen spinner reads
-    as "broken".
-    """
-    status = get_status()
-    if not status.available:
-        raise LLMUnavailableError("No local LLM is running.")
-
-    model = model or status.model
-    temperature = config.LLM_TEMPERATURE if temperature is None else temperature
-
-    try:
-        if status.provider == "ollama":
-            url = f"{status.host}/api/chat"
-            payload = {
-                "model": model,
-                "messages": messages,
-                "stream": True,
-                "options": {"temperature": temperature},
-            }
-        else:
-            url = f"{status.host}/v1/chat/completions"
-            payload = {
-                "model": model,
-                "messages": messages,
-                "temperature": temperature,
-                "stream": True,
-            }
-
-        with requests.post(
-            url, json=payload, stream=True, timeout=config.LLM_TIMEOUT_SECONDS
-        ) as response:
-            response.raise_for_status()
-            for raw_line in response.iter_lines():
-                if not raw_line:
-                    continue
-                line = raw_line.decode("utf-8")
-
-                if status.provider == "lmstudio":
-                    # OpenAI-compatible SSE frames are prefixed with "data: ".
-                    if not line.startswith("data: "):
-                        continue
-                    line = line[6:]
-                    if line.strip() == "[DONE]":
-                        break
-
-                try:
-                    chunk = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-
-                if status.provider == "ollama":
-                    token = chunk.get("message", {}).get("content", "")
-                    if token:
-                        yield token
-                    if chunk.get("done"):
-                        break
-                else:
-                    choices = chunk.get("choices") or []
-                    if choices:
-                        token = choices[0].get("delta", {}).get("content", "")
-                        if token:
-                            yield token
-
-    except requests.Timeout as exc:
-        raise LLMUnavailableError("The model timed out mid-response.") from exc
-    except requests.RequestException as exc:
-        raise LLMUnavailableError(f"Streaming failed: {exc}") from exc
-
-
-# --------------------------------------------------------------------------- #
-# JSON helper -- shared by the Receipt Splitter and the Quick Log parser
-# --------------------------------------------------------------------------- #
-def chat_json(
-    messages: list[dict[str, str]],
-    model: str | None = None,
-    retries: int = 1,
-) -> dict[str, Any] | list[Any]:
-    """
-    Chat and parse the reply as JSON.
-
-    Small models wrap JSON in prose or markdown fences even when told not to, so
-    the response is salvaged before giving up, and retried once with a blunter
-    instruction. Provided centrally because three teammates need exactly this:
-
-    * Receipt Splitting  -- ``{item: price}``
-    * Natural Language Quick Log -- ``{amount, category, merchant}``
-    * Broke Alert -- structured warning fields
-
-    Raises :class:`LLMUnavailableError` if nothing parseable comes back.
-    """
-    attempt = 0
-    last_reply = ""
-    while attempt <= retries:
-        current = messages if attempt == 0 else messages + [{
-            "role": "user",
-            "content": "Return ONLY valid JSON. No explanation, no markdown fences.",
-        }]
-
-        last_reply = chat(current, model=model, json_mode=True, temperature=0.1)
-        parsed = extract_json(last_reply)
-        if parsed is not None:
-            return parsed
-        attempt += 1
-
-    raise LLMUnavailableError(
-        f"Model did not return valid JSON after {retries + 1} attempts. "
-        f"Last reply: {last_reply[:200]}"
-    )
-
-
-def extract_json(text: str) -> dict[str, Any] | list[Any] | None:
-    """
-    Pull a JSON object or array out of a possibly chatty reply.
-
-    Tried in order: the whole string, a ```json fenced block, then the widest
-    brace/bracket span. Returns ``None`` if nothing parses.
-    """
-    if not text:
-        return None
-
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        pass
-
-    fenced = re.search(r"```(?:json)?\s*(.*?)```", text, re.DOTALL)
-    if fenced:
-        try:
-            return json.loads(fenced.group(1).strip())
-        except json.JSONDecodeError:
-            pass
-
-    for opening, closing in (("{", "}"), ("[", "]")):
-        start = text.find(opening)
-        end = text.rfind(closing)
-        if start != -1 and end > start:
-            try:
-                return json.loads(text[start:end + 1])
-            except json.JSONDecodeError:
-                continue
-
-    return None
-
-
-# --------------------------------------------------------------------------- #
-# Convenience
-# --------------------------------------------------------------------------- #
-def ask(prompt: str, system: str | None = None, **kwargs: Any) -> str:
-    """One-shot helper for teammates who do not need multi-turn history."""
     messages: list[dict[str, str]] = []
     if system:
         messages.append({"role": "system", "content": system})
     messages.append({"role": "user", "content": prompt})
-    return chat(messages, **kwargs)
+
+    try:
+        client = _get_client()
+        response = client.chat(
+            model=model,
+            messages=messages,
+            options={"temperature": temperature},
+            stream=False,
+        )
+        # The SDK returns a ChatResponse object; pull the text out safely.
+        if isinstance(response, dict):
+            return response.get("message", {}).get("content", "")
+        return response.message.content  # type: ignore[union-attr]
+    except LLMError:
+        raise
+    except Exception as exc:
+        raise LLMError(f"Generation failed ({model}): {exc}") from exc
+
+
+def generate_stream(
+    prompt: str,
+    *,
+    system: str = "",
+    model: str | None = None,
+    temperature: float | None = None,
+    timeout: int | None = None,
+) -> Iterator[str]:
+    """
+    Streaming text generation — yields tokens one at a time.
+
+    Same parameters as :func:`generate`. The caller should iterate over
+    the return value and concatenate the tokens.
+    """
+    model = model or config.OLLAMA_CHAT_MODEL
+    temperature = temperature if temperature is not None else config.LLM_TEMPERATURE
+
+    messages: list[dict[str, str]] = []
+    if system:
+        messages.append({"role": "system", "content": system})
+    messages.append({"role": "user", "content": prompt})
+
+    try:
+        client = _get_client()
+        stream = client.chat(
+            model=model,
+            messages=messages,
+            options={"temperature": temperature},
+            stream=True,
+        )
+        for chunk in stream:
+            if isinstance(chunk, dict):
+                token = chunk.get("message", {}).get("content", "")
+            else:
+                token = chunk.message.content  # type: ignore[union-attr]
+            if token:
+                yield token
+    except LLMError:
+        raise
+    except Exception as exc:
+        raise LLMError(f"Streaming generation failed ({model}): {exc}") from exc
+
+
+def generate_with_messages(
+    messages: list[dict[str, str]],
+    *,
+    model: str | None = None,
+    temperature: float | None = None,
+    timeout: int | None = None,
+) -> str:
+    """
+    Generate a response from a full message list (system + history + user).
+
+    This is the multi-turn variant used by :mod:`rag_engine` where the
+    conversation history is already assembled.
+    """
+    model = model or config.OLLAMA_CHAT_MODEL
+    temperature = temperature if temperature is not None else config.LLM_TEMPERATURE
+    timeout = timeout if timeout is not None else config.LLM_TIMEOUT_SECONDS
+
+    try:
+        client = _get_client()
+        response = client.chat(
+            model=model,
+            messages=messages,
+            options={"temperature": temperature},
+            stream=False,
+        )
+        if isinstance(response, dict):
+            return response.get("message", {}).get("content", "")
+        return response.message.content  # type: ignore[union-attr]
+    except LLMError:
+        raise
+    except Exception as exc:
+        raise LLMError(f"Generation failed ({model}): {exc}") from exc
+
+
+def generate_stream_with_messages(
+    messages: list[dict[str, str]],
+    *,
+    model: str | None = None,
+    temperature: float | None = None,
+    timeout: int | None = None,
+) -> Iterator[str]:
+    """
+    Streaming variant of :func:`generate_with_messages`.
+
+    Yields tokens one at a time for live UI rendering.
+    """
+    model = model or config.OLLAMA_CHAT_MODEL
+    temperature = temperature if temperature is not None else config.LLM_TEMPERATURE
+
+    try:
+        client = _get_client()
+        stream = client.chat(
+            model=model,
+            messages=messages,
+            options={"temperature": temperature},
+            stream=True,
+        )
+        for chunk in stream:
+            if isinstance(chunk, dict):
+                token = chunk.get("message", {}).get("content", "")
+            else:
+                token = chunk.message.content  # type: ignore[union-attr]
+            if token:
+                yield token
+    except LLMError:
+        raise
+    except Exception as exc:
+        raise LLMError(f"Streaming generation failed ({model}): {exc}") from exc
+
+
+# ────────────────────────────────────────────────────────────────────
+# Embeddings
+# ────────────────────────────────────────────────────────────────────
+
+def embed(text: str, *, model: str | None = None) -> list[float]:
+    """
+    Generate an embedding vector for a single piece of text.
+
+    Parameters
+    ----------
+    text : str
+        The text to embed. Leading/trailing whitespace is stripped.
+    model : str | None
+        Embedding model. Falls back to ``config.OLLAMA_EMBED_MODEL``.
+
+    Returns
+    -------
+    list[float]
+        A vector of length ``config.EMBEDDING_DIM`` (768 for nomic-embed-text).
+    """
+    model = model or config.OLLAMA_EMBED_MODEL
+    text = text.strip()
+    if not text:
+        raise LLMError("Cannot embed an empty string.")
+
+    try:
+        client = _get_client()
+        response = client.embed(model=model, input=text)
+        # The SDK returns {"embeddings": [[...]]}
+        if isinstance(response, dict):
+            embeddings = response.get("embeddings", [])
+            if embeddings and len(embeddings) > 0:
+                return embeddings[0]
+            raise LLMError("Ollama returned empty embeddings.")
+        # Fallback for object-style response
+        return response.embeddings[0]  # type: ignore[union-attr]
+    except LLMError:
+        raise
+    except Exception as exc:
+        raise LLMError(f"Embedding failed ({model}): {exc}") from exc
+
+
+def embed_batch(
+    texts: list[str],
+    *,
+    model: str | None = None,
+    batch_size: int = 32,
+) -> list[list[float]]:
+    """
+    Embed multiple texts efficiently.
+
+    Sends texts in batches to the Ollama embed endpoint. The batch size
+    is capped to avoid overwhelming the daemon on a laptop.
+
+    Parameters
+    ----------
+    texts : list[str]
+        Texts to embed. Empty strings are skipped (a zero-vector is
+        returned in their position).
+    model : str | None
+        Embedding model. Falls back to ``config.OLLAMA_EMBED_MODEL``.
+    batch_size : int
+        Number of texts per request. Default 32.
+
+    Returns
+    -------
+    list[list[float]]
+        One embedding vector per input text, in the same order.
+    """
+    model = model or config.OLLAMA_EMBED_MODEL
+    results: list[list[float]] = []
+    zero_vec = [0.0] * config.EMBEDDING_DIM
+
+    for i in range(0, len(texts), batch_size):
+        batch = texts[i : i + batch_size]
+        # Filter out empty strings, preserving indices.
+        non_empty_indices: list[int] = []
+        non_empty_texts: list[str] = []
+        for j, t in enumerate(batch):
+            stripped = t.strip()
+            if stripped:
+                non_empty_indices.append(j)
+                non_empty_texts.append(stripped)
+
+        if not non_empty_texts:
+            results.extend([zero_vec] * len(batch))
+            continue
+
+        try:
+            client = _get_client()
+            response = client.embed(model=model, input=non_empty_texts)
+            if isinstance(response, dict):
+                embeddings = response.get("embeddings", [])
+            else:
+                embeddings = response.embeddings  # type: ignore[union-attr]
+        except Exception as exc:
+            raise LLMError(f"Batch embedding failed ({model}): {exc}") from exc
+
+        # Reconstruct the full batch with zero vectors for skipped slots.
+        batch_results: list[list[float]] = [zero_vec] * len(batch)
+        for idx, emb_idx in enumerate(non_empty_indices):
+            if idx < len(embeddings):
+                batch_results[emb_idx] = embeddings[idx]
+        results.extend(batch_results)
+
+    return results

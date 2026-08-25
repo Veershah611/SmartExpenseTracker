@@ -70,6 +70,7 @@ OLLAMA_CHAT_MODEL: str = os.getenv("OLLAMA_CHAT_MODEL", "llama3.2:latest")
 # model (lower quality, no extra download), and then to a lexical index if
 # Ollama is unreachable entirely. The demo never hard-fails on a missing model.
 OLLAMA_EMBED_MODEL: str = os.getenv("OLLAMA_EMBED_MODEL", "nomic-embed-text")
+EMBEDDING_DIM: int = 768
 
 LLM_TEMPERATURE: float = float(os.getenv("LLM_TEMPERATURE", "0.3"))  # low = factual
 LLM_TIMEOUT_SECONDS: int = int(os.getenv("LLM_TIMEOUT_SECONDS", "120"))
